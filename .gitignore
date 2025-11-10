@@ -47,3 +47,7 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# DB and data files that are private
+toggl_entries.sqlite
+toggl_time_entries_latest.csv
