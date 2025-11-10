@@ -115,8 +115,16 @@ ui <- fluidPage(
   fluidRow(
     column(12,
       tabsetPanel(
-        tabPanel("Table", gt_output("project_task_table")),
-        tabPanel("Targets", plotlyOutput("category_plot", height = "520px")),
+        tabPanel("Tracking",
+          fluidRow(
+            column(6,
+              gt_output("project_task_table")
+            ),
+            column(6,
+              plotlyOutput("category_plot", height = "520px")
+            )
+          )
+        ),
         tabPanel("Calendar",
           div(style = "margin-bottom:8px;", selectInput("calendar_color", "Color by", choices = c("Project", "Category"), selected = "Project", width = "200px")),
           plotlyOutput("calendar_plot", height = "720px")
