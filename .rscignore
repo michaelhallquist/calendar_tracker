@@ -1,0 +1,19 @@
+# Exclude VCS metadata and RStudio project files
+.git/
+.gitignore
+.Rproj.user/
+*.Rproj
+
+# Exclude local/ephemeral artifacts
+*.sqlite
+*_latest.csv
+.DS_Store
+
+# Optional: logs and temp files
+*.log
+*.tmp
+~*
+
+# google calendar and office365
+office365/
+gcal/
