@@ -50,4 +50,12 @@ rsconnect/
 
 # DB and data files that are private
 toggl_entries.sqlite
+toggl_entries.sqlite-wal
+toggl_entries.sqlite-shm
 toggl_time_entries_latest.csv
+
+office365/
+gcal/
+
+.DS_Store
+.posit/
