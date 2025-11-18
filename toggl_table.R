@@ -12,7 +12,7 @@ library(readr)
 
 # Always pull latest entries via toggl_api.R
 source("toggl_api.R")
-source("gcal/gcal_rest.R")
+source("gcal_rest.R")
 
 local_tz <- "America/New_York"
 
