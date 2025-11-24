@@ -39,6 +39,7 @@ gcal_local_tz <- {
 })
 
 .gcal_state <- new.env(parent = emptyenv())
+.gcal_state$token_written <- FALSE
 gcal_scope <- "https://www.googleapis.com/auth/calendar.readonly"
 gcal_base  <- "https://www.googleapis.com/calendar/v3"
 
@@ -78,47 +79,91 @@ gcal_client <- function() {
   .gcal_state$client
 }
 
-gcal_token <- function(scope = gcal_scope) {
-  if (!is.null(.gcal_state$token)) {
-    return(.gcal_state$token)
+gcal_token_cache_dir <- function() {
+  cache_opt <- gargle::gargle_oauth_cache()
+  if (is.character(cache_opt) && length(cache_opt) == 1L && nzchar(cache_opt)) {
+    cache_path <- cache_opt
+  } else {
+    cache_path <- "~/.config/gargle"
+    cache_path <- path.expand(cache_path)
+    options(gargle_oauth_cache = cache_path)
   }
+  cache_path <- path.expand(cache_path)
+  dir.create(cache_path, recursive = TRUE, showWarnings = FALSE)
+  cache_path
+}
 
-  tok <- NULL
+gcal_seed_cache_from_secret <- function(path, key_env_name) {
+  if (isTRUE(.gcal_state$cache_seeded)) return(invisible(FALSE))
+  if (!nzchar(path) || !file.exists(path) || !gargle::secret_has_key(key_env_name)) {
+    return(invisible(FALSE))
+  }
+  message(sprintf("GCAL token: seeding gargle cache from %s", path))
+  tok <- tryCatch(
+    gargle::secret_read_rds(path, key = key_env_name),
+    error = function(e) {
+      message(sprintf("GCAL token: failed to read secret RDS (%s)", conditionMessage(e)))
+      NULL
+    }
+  )
+  if (is.null(tok)) return(invisible(FALSE))
+  cache_dir <- gcal_token_cache_dir()
+  tok$cache_path <- cache_dir
+  cache_file <- file.path(cache_dir, tok$hash())
+  try(saveRDS(tok, cache_file), silent = TRUE)
+  .gcal_state$cache_seeded <- TRUE
+  invisible(TRUE)
+}
 
-  # 1) Try a pre-encoded token saved via gargle::secret_write_rds()
+gcal_refresh_token <- function(tok) {
+  if (is.null(tok)) return(tok)
+  attr(tok, "gcal_refreshed") <- FALSE
+  has_refresh <- !is.null(tok$credentials$refresh_token) && nzchar(tok$credentials$refresh_token)
+  if (!has_refresh) return(tok) # cannot refresh
+
+  token_valid <- tryCatch(
+    if (is.function(tok$validate)) tok$validate() else FALSE,
+    error = function(e) FALSE
+  )
+  can_refresh <- tryCatch(isTRUE(tok$can_refresh()), error = function(e) FALSE)
+
+  needs_refresh <- isFALSE(token_valid) || is.na(token_valid)
+  if (!needs_refresh || !can_refresh) return(tok) # refresh not possible or not needed
+
+  message("GCAL token: refreshing access token")
+  try(tok$refresh(), silent = TRUE)
+  attr(tok, "gcal_refreshed") <- TRUE
+  tok
+}
+
+gcal_token <- function(scope = gcal_scope) {
   token_rds_path <- Sys.getenv("GCAL_TOKEN_RDS", unset = ".secrets/gcal-token.rds")
   key_env_name <- "GARGLE_KEY"
   has_key <- gargle::secret_has_key(key_env_name)
-  if (nzchar(token_rds_path) && file.exists(token_rds_path) && has_key) {
-    message(sprintf("GCAL token: attempting to load %s with key '%s'", token_rds_path, key_env_name))
-    tok <- tryCatch(
-      gargle::secret_read_rds(token_rds_path, key = key_env_name),
-      error = function(e) {
-        message(sprintf("GCAL token: failed to read secret RDS (%s)", conditionMessage(e)))
-        NULL
-      }
-    )
-    if (!is.null(tok)) message("GCAL token: loaded token from secret RDS")
-  }
+  gcal_seed_cache_from_secret(token_rds_path, key_env_name)
+  tok <- gargle::token_fetch(
+    scopes = scope,
+    client = gcal_client(),
+    cache = gargle::gargle_oauth_cache(),
+    email = gargle::gargle_oauth_email()
+  )
 
-  # 2) Fall back to the standard cache-based fetch;
-  #    this will also mint a new token interactively if needed.
-  if (is.null(tok)) {
-    tok <- gargle::token_fetch(
-      scopes = scope,
-      client = gcal_client(),
-      cache = gargle::gargle_oauth_cache(),
-      email = gargle::gargle_oauth_email()
+  tok <- gcal_refresh_token(tok)
+  refreshed <- isTRUE(attr(tok, "gcal_refreshed"))
+
+  should_write <- !is.null(tok) &&
+    nzchar(token_rds_path) &&
+    has_key &&
+    (refreshed || !isTRUE(.gcal_state$token_written))
+
+  if (should_write) {
+    dir.create(dirname(token_rds_path), recursive = TRUE, showWarnings = FALSE)
+    message(sprintf("GCAL token: writing token to %s with key '%s'", token_rds_path, key_env_name))
+    try(
+      gargle::secret_write_rds(tok, token_rds_path, key = key_env_name),
+      silent = TRUE
     )
-    # If we got a token, persist it for deployments that lack interactive auth
-    if (!is.null(tok) && nzchar(token_rds_path) && has_key) {
-      dir.create(dirname(token_rds_path), recursive = TRUE, showWarnings = FALSE)
-      message(sprintf("GCAL token: writing token to %s with key '%s'", token_rds_path, key_env_name))
-      try(
-        gargle::secret_write_rds(tok, token_rds_path, key = key_env_name),
-        silent = TRUE
-      )
-    }
+    .gcal_state$token_written <- TRUE
   }
 
   if (is.null(tok)) {
@@ -127,7 +172,6 @@ gcal_token <- function(scope = gcal_scope) {
   if (is.null(tok$credentials$access_token)) {
     stop("Google Calendar authentication failed: access token is missing. Re-authenticate (remove old cache if needed) so gargle can mint a new token.")
   }
-  .gcal_state$token <- tok
   tok
 }
 
@@ -177,6 +221,53 @@ gcal_resolve_calendar <- function(token = NULL, refresh = FALSE) {
     as.list()
   .gcal_state$calendar_info <- info
   info
+}
+
+gcal_parse_calendar_specs <- function(specs) {
+  if (is.null(specs) || !length(specs)) return(tibble())
+  specs <- trimws(specs)
+  specs <- specs[nzchar(specs)]
+  if (!length(specs)) return(tibble())
+  parsed <- purrr::map_dfr(specs, function(s) {
+    parts <- strsplit(s, "\\|", fixed = FALSE)[[1]]
+    cal_id <- trimws(parts[1])
+    cal_label <- if (length(parts) >= 2) trimws(parts[2]) else cal_id
+    if (!nzchar(cal_id)) return(NULL)
+    tibble(id = cal_id, summary = ifelse(nzchar(cal_label), cal_label, cal_id))
+  })
+  parsed
+}
+
+gcal_calendars_to_fetch <- function(token = NULL, calendar_id = NULL, calendar_ids = NULL) {
+  if (!is.null(calendar_id)) {
+    calendar_ids <- c(calendar_id)
+  }
+  if (is.null(calendar_ids)) {
+    env_ids <- Sys.getenv("GCAL_CALENDAR_IDS", unset = "")
+    if (nzchar(env_ids)) {
+      calendar_ids <- unlist(strsplit(env_ids, "[,;]", perl = TRUE))
+    }
+  }
+
+  parsed <- gcal_parse_calendar_specs(calendar_ids)
+  if (nrow(parsed)) {
+    return(parsed %>% mutate(primary = NA))
+  }
+
+  env_id <- Sys.getenv("GCAL_CALENDAR_ID")
+  env_name <- Sys.getenv("GCAL_CALENDAR_NAME")
+  if (nzchar(env_id)) {
+    return(tibble(
+      id = env_id,
+      summary = if (nzchar(env_name)) env_name else env_id,
+      primary = NA
+    ))
+  }
+
+  tok <- token %||% gcal_token()
+  cal_tbl <- gcal_list_calendars(tok)
+  if (!nrow(cal_tbl)) stop("No calendars available for this account.")
+  cal_tbl %>% arrange(desc(primary))
 }
 
 gcal_fmt_rfc3339 <- function(x) format(with_tz(x, "UTC"), "%Y-%m-%dT%H:%M:%SZ")
@@ -420,19 +511,19 @@ gcal_event_window <- function(weeks_before, weeks_after, local_tz) {
 get_gcal_events <- function(weeks_before = 3L,
                             weeks_after = 3L,
                             local_tz = Sys.getenv("GCAL_LOCAL_TZ", "America/New_York"),
-                            calendar_id = NULL) {
-  calendar_info <- gcal_resolve_calendar()
-  if (!is.null(calendar_id)) {
-    calendar_info$id <- calendar_id
-    calendar_info$summary <- calendar_id
-  }
+                            calendar_id = NULL,
+                            calendar_ids = NULL) {
+  tok <- gcal_token()
+  calendars <- gcal_calendars_to_fetch(token = tok, calendar_id = calendar_id, calendar_ids = calendar_ids)
   window <- gcal_event_window(weeks_before, weeks_after, local_tz)
   time_min <- with_tz(window$start_local, "UTC")
   time_max <- with_tz(window$end_local + days(1), "UTC")
 
-  tok <- gcal_token()
-  events_raw <- gcal_fetch_all_events(calendar_info$id, time_min, time_max, token = tok)
-  events_df <- gcal_tidy_events(events_raw, calendar_info)
+  events_df <- purrr::map_dfr(seq_len(nrow(calendars)), function(i) {
+    info <- calendars[i, ]
+    events_raw <- gcal_fetch_all_events(info$id, time_min, time_max, token = tok)
+    gcal_tidy_events(events_raw, list(id = info$id, summary = info$summary %||% info$id))
+  })
 
   con <- gcal_init_db_connection()
   on.exit(try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)

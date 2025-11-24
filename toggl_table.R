@@ -10,13 +10,33 @@ library(purrr)
 library(forcats)
 library(readr)
 
-# Always pull latest entries via toggl_api.R
+# Data + calendar helpers
 source("toggl_api.R")
 source("gcal_rest.R")
+source("calendar_plots.R")
 
 local_tz <- "America/New_York"
+uncategorized_label <- "Uncategorized"
+workday_start_hour <- 8
+workday_end_hour   <- 18
+slot_step_minutes  <- 30
 
 # Helpers ---------------------------------------------------------------
+apply_uncategorized_labels <- function(df, label = uncategorized_label) {
+  if (is.null(df) || !nrow(df)) return(df)
+  df <- df %>%
+    mutate(
+      project = ifelse(is.na(project) | !nzchar(trimws(project)), label, project)
+    )
+  if ("category" %in% names(df)) {
+    df <- df %>%
+      mutate(
+        category = ifelse(is.na(category) | !nzchar(trimws(category)), label, category)
+      )
+  }
+  df
+}
+
 prepare_toggl <- function(entries_df, local_tz = "America/New_York", week_start = 7) {
   if (is.null(entries_df) || !nrow(entries_df)) return(tibble())
   entries_df %>%
@@ -34,17 +54,141 @@ prepare_toggl <- function(entries_df, local_tz = "America/New_York", week_start 
     )
 }
 
-categorize_tasks <- function(df, rules = NULL, default = "Uncategorized") {
+categorize_tasks <- function(df, rules = NULL, default = uncategorized_label) {
   if (is.null(df) || !nrow(df)) return(tibble())
-  if (is.null(rules) || nrow(rules) == 0) return(df %>% mutate(category = default))
-  df %>%
-    rowwise() %>%
-    mutate(category = {
-      txt <- paste(project %||% "", task_title %||% "", sep = " | ")
-      hit <- rules$category[stringr::str_detect(txt, rules$pattern)][1]
-      ifelse(is.na(hit), default, hit)
-    }) %>%
-    ungroup()
+  df <- if (is.null(rules) || nrow(rules) == 0) {
+    df %>% mutate(category = default)
+  } else {
+    df %>%
+      rowwise() %>%
+      mutate(category = {
+        txt <- paste(project %||% "", task_title %||% "", sep = " | ")
+        hit <- rules$category[stringr::str_detect(txt, rules$pattern)][1]
+        ifelse(is.na(hit), default, hit)
+      }) %>%
+      ungroup()
+  }
+  apply_uncategorized_labels(df, label = default)
+}
+
+merge_intervals <- function(df) {
+  if (is.null(df) || !nrow(df)) {
+    return(tibble(start = as_datetime(character()), end = as_datetime(character())))
+  }
+  df <- df %>% arrange(start, end)
+  starts <- c()
+  ends <- c()
+  cur_start <- df$start[1]
+  cur_end <- df$end[1]
+  if (nrow(df) > 1) {
+    for (i in 2:nrow(df)) {
+      s <- df$start[i]
+      e <- df$end[i]
+      if (s <= cur_end) {
+        cur_end <- max(cur_end, e, na.rm = TRUE)
+      } else {
+        starts <- c(starts, cur_start)
+        ends   <- c(ends, cur_end)
+        cur_start <- s
+        cur_end   <- e
+      }
+    }
+  }
+  starts <- c(starts, cur_start)
+  ends   <- c(ends, cur_end)
+  tibble(start = starts, end = ends)
+}
+
+find_free_slots <- function(events_df, duration_hours = 1, days_ahead = 14, tz = local_tz) {
+  if (is.null(events_df)) events_df <- tibble()
+  today_local <- floor_date(with_tz(now(), tz), unit = "day")
+  target_days <- seq(today_local, by = "day", length.out = days_ahead)
+  target_days <- target_days[wday(target_days, week_start = 1) <= 5]  # Monday = 1
+
+  slots <- map_dfr(target_days, function(day_start) {
+    day_start_dt <- as_datetime(day_start, tz = tz)
+    window_start <- day_start_dt + hours(workday_start_hour)
+    window_end   <- day_start_dt + hours(workday_end_hour)
+
+    busy <- tibble()
+    if (!is.null(events_df) && nrow(events_df)) {
+      busy <- events_df %>%
+        filter(start_local < window_end, end_local > window_start) %>%
+        transmute(
+          start = pmax(start_local, window_start),
+          end   = pmin(end_local, window_end)
+        ) %>%
+        filter(start < end) %>%
+        mutate(
+          start = as_datetime(start, tz = tz),
+          end   = as_datetime(end, tz = tz)
+        )
+    }
+    busy <- merge_intervals(busy)
+    if (nrow(busy)) {
+      busy <- busy %>%
+        mutate(
+          start = as_datetime(start, tz = tz),
+          end   = as_datetime(end, tz = tz)
+        )
+    }
+
+    free_blocks <- tibble()
+    cursor <- window_start
+    if (nrow(busy)) {
+      for (i in seq_len(nrow(busy))) {
+        if (busy$start[i] > cursor) {
+          free_blocks <- bind_rows(free_blocks, tibble(start = cursor, end = busy$start[i]))
+        }
+        if (busy$end[i] > cursor) {
+          cursor <- busy$end[i]
+        }
+      }
+    }
+    if (cursor < window_end) {
+      free_blocks <- bind_rows(free_blocks, tibble(start = cursor, end = window_end))
+    }
+    if (nrow(free_blocks)) {
+      free_blocks <- free_blocks %>%
+        mutate(
+          start = as_datetime(start, tz = tz),
+          end   = as_datetime(end, tz = tz)
+        )
+    }
+    if (!nrow(free_blocks)) return(tibble())
+
+    dur <- dseconds(duration_hours * 3600)
+    step <- dminutes(slot_step_minutes)
+    map_dfr(seq_len(nrow(free_blocks)), function(i) {
+      fs <- free_blocks$start[i]
+      fe <- free_blocks$end[i]
+      # Align to slot grid
+      slot_start <- ceiling_date(fs, paste0(slot_step_minutes, " minutes"))
+      out <- list()
+      while ((slot_start + dur) <= fe) {
+        out <- append(out, list(tibble(
+          day = as_date(slot_start),
+          start_local = as_datetime(slot_start, tz = tz),
+          end_local = as_datetime(slot_start + dur, tz = tz)
+        )))
+        slot_start <- slot_start + step
+      }
+      if (length(out)) bind_rows(out) else tibble()
+    })
+  })
+
+  if (!nrow(slots)) return(tibble())
+  slots %>%
+    mutate(
+      weekday = wday(start_local, label = TRUE, abbr = FALSE),
+      time_range = sprintf(
+        "%s — %s",
+        format(start_local, "%I:%M %p"),
+        format(end_local, "%I:%M %p")
+      ),
+      day_label = format(start_local, "%a %Y-%m-%d")
+    ) %>%
+    select(day_label, weekday, time_range, start_local, end_local)
 }
 
 summarize_by_project_task <- function(df) {
@@ -93,140 +237,6 @@ format_compact_datetime <- function(x) {
     )
   }
   out
-}
-
-build_calendar_segments <- function(df, ws, we, local_tz) {
-  if (is.null(df) || !nrow(df)) return(tibble())
-  df %>%
-    filter(!is.na(start_local) & !is.na(end_local)) %>%
-    mutate(
-      seg_start = pmax(start_local, ws),
-      seg_end   = pmin(end_local, we + days(1))
-    ) %>%
-    filter(seg_end > seg_start) %>%
-    rowwise() %>%
-    mutate(
-      day_list = list(
-        seq.Date(
-          as_date(floor_date(seg_start, "day")),
-          as_date(floor_date(seg_end - seconds(1), "day")),
-          by = "day"
-        )
-      )
-    ) %>%
-    ungroup() %>%
-    tidyr::unnest(day_list, keep_empty = FALSE) %>%
-    mutate(
-      day_start = as_datetime(day_list, tz = local_tz),
-      day_end   = day_start + days(1),
-      part_start = pmax(seg_start, day_start),
-      part_end   = pmin(seg_end, day_end),
-      part_dur_h = as.numeric(difftime(part_end, part_start, units = "hours")),
-      dow        = wday(day_start, week_start = 7, label = TRUE, abbr = FALSE)
-    ) %>%
-    filter(part_end > part_start) %>%
-    mutate(
-      start_hour = hour(part_start) + minute(part_start)/60 + second(part_start)/3600,
-      end_hour   = hour(part_end) + minute(part_end)/60 + second(part_end)/3600
-    ) %>%
-    mutate(dow = factor(as.character(dow), levels = c("Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday")))
-}
-
-calendar_plot_from_segments <- function(segs, ws, we, title_text) {
-  if (is.null(segs) || !nrow(segs)) return(NULL)
-  segs <- segs %>%
-    mutate(
-      all_day = dplyr::coalesce(as.logical(all_day), FALSE),
-      color_var = ifelse(is.na(color_var) | !nzchar(color_var), "(no group)", color_var),
-      tooltip   = ifelse(is.na(tooltip) | !nzchar(tooltip), "(no details)", tooltip)
-    )
-
-  timed_hours <- c(segs$start_hour[!segs$all_day], segs$end_hour[!segs$all_day])
-  if (length(timed_hours) && all(is.finite(timed_hours))) {
-    hour_min <- floor(min(timed_hours, na.rm = TRUE))
-    hour_max <- ceiling(max(timed_hours, na.rm = TRUE))
-  } else {
-    hour_min <- 0
-    hour_max <- 24
-  }
-  hour_min <- max(0, hour_min)
-  hour_max <- min(24, hour_max)
-  if ((hour_max - hour_min) < 1) {
-    hour_max <- min(24, hour_min + 1)
-  }
-  tick_step <- if ((hour_max - hour_min) > 12) 2 else 1
-
-  has_all_day <- any(segs$all_day)
-  if (has_all_day) {
-    segs <- segs %>%
-      mutate(
-        start_hour = ifelse(all_day, -0.45, start_hour),
-        end_hour   = ifelse(all_day, -0.05, end_hour)
-      )
-  }
-
-  lvl <- sort(unique(segs$color_var))
-  col_map <- stats::setNames(grDevices::hcl.colors(max(length(lvl), 1), "Dark 3"), lvl)
-  dow_labels <- levels(segs$dow)
-
-  segs <- segs %>% mutate(
-    dow_num = as.numeric(dow),
-    xmin = dow_num - 0.45,
-    xmax = dow_num + 0.45,
-    ymin = start_hour,
-    ymax = end_hour
-  )
-
-  p <- plot_ly()
-  for (g in lvl) {
-    dfg <- segs %>% filter(color_var == g)
-    if (!nrow(dfg)) next
-    for (i in seq_len(nrow(dfg))) {
-      show_leg <- (i == 1)
-      p <- p %>% add_polygons(
-        x = c(dfg$xmin[i], dfg$xmax[i], dfg$xmax[i], dfg$xmin[i], dfg$xmin[i]),
-        y = c(dfg$ymin[i], dfg$ymin[i], dfg$ymax[i], dfg$ymax[i], dfg$ymin[i]),
-        name = g,
-        legendgroup = g,
-        fillcolor = unname(col_map[g]),
-        text = rep(dfg$tooltip[i], 5),
-        hoverinfo = "text",
-        hoveron = "fills",
-        line = list(color = "black", width = 0.8),
-        showlegend = show_leg,
-        inherit = FALSE
-      )
-    }
-  }
-
-  tick_vals <- seq(hour_min, hour_max, by = tick_step)
-  tick_text <- sprintf("%02d:00", tick_vals)
-  axis_min <- hour_min
-  if (has_all_day) {
-    tick_vals <- c(-0.25, tick_vals)
-    tick_text <- c("All Day", tick_text)
-    axis_min <- min(-0.6, hour_min)
-  }
-
-  p %>% layout(
-    title = title_text,
-    legend = list(groupclick = "togglegroup"),
-    xaxis = list(
-      title = "Day",
-      tickmode = "array",
-      tickvals = 1:7,
-      ticktext = dow_labels,
-      range = c(0.5, 7.5)
-    ),
-    yaxis = list(
-      title = "Time of Day",
-      autorange = "reversed",
-      range = c(hour_max, axis_min),
-      tickmode = "array",
-      tickvals = tick_vals,
-      ticktext = tick_text
-    )
-  )
 }
 
 gt_project_task_table <- function(rollup_df, title = "Time by Project and Task", empty_message = "No data for this week") {
@@ -323,6 +333,26 @@ ui <- fluidPage(
           div(style = "margin-bottom:8px;", selectInput("calendar_color", "Color by", choices = c("Project", "Category"), selected = "Project", width = "200px")),
           plotlyOutput("calendar_plot", height = "720px")
         ),
+        tabPanel("Schedule",
+          fluidRow(
+            column(4,
+              selectInput(
+                "schedule_duration",
+                "Desired duration",
+                choices = {
+                  durs <- seq(0.5, 3, by = 0.5)
+                  labels <- ifelse(durs < 1, paste0(durs * 60, " minutes"), paste0(durs, " hours"))
+                  stats::setNames(durs, labels)
+                },
+                selected = 1
+              )
+            ),
+            column(8,
+              div("Suggested openings (next 2 weeks, Mon–Fri, 8am–6pm)"),
+              gt_output("schedule_table")
+            )
+          )
+        ),
         tabPanel("Gcal",
           div(style = "margin-bottom:8px;", selectInput("gcal_color", "Color by", choices = c("Calendar", "Organizer"), selected = "Calendar", width = "200px")),
           plotlyOutput("gcal_plot", height = "720px")
@@ -380,11 +410,12 @@ server <- function(input, output, session) {
   })
 
   categorized <- reactive({
-    categorize_tasks(prepared(), rules, default = "Other")
+    categorize_tasks(prepared(), rules, default = uncategorized_label)
   })
 
   history_prepared <- reactive({
-    prepare_toggl(toggl_history(), local_tz = local_tz, week_start = 7)
+    prepare_toggl(toggl_history(), local_tz = local_tz, week_start = 7) %>%
+      apply_uncategorized_labels(label = uncategorized_label)
   })
 
   observeEvent(history_prepared(), {
@@ -471,6 +502,34 @@ server <- function(input, output, session) {
     if (is.null(df) || !nrow(df)) return(df)
     rng <- selected_week_range()
     df %>% filter(week_start == rng$ws)
+  })
+
+  gcal_color_map <- reactive({
+    df <- gcal_selected_week()
+    if (is.null(df) || !nrow(df)) return(character())
+    col_vec <- if (identical(input$gcal_color, "Organizer")) df$organizer else df$calendar_name
+    build_color_map(col_vec)
+  })
+
+  gcal_next_two_weeks <- reactive({
+    input$refresh
+    tryCatch(
+      get_gcal_events(weeks_before = 0L, weeks_after = 2L, local_tz = local_tz),
+      error = function(err) {
+        warning("Google Calendar fetch (next two weeks) failed: ", conditionMessage(err))
+        tibble()
+      }
+    )
+  })
+
+  gcal_future_prepared <- reactive({
+    df <- gcal_next_two_weeks()
+    if (is.null(df) || !nrow(df)) return(df)
+    df %>%
+      mutate(
+        start_local = with_tz(start_utc, local_tz),
+        end_local   = with_tz(end_utc, local_tz)
+      )
   })
 
   # Selected week data
@@ -648,8 +707,36 @@ server <- function(input, output, session) {
       segs,
       rng$ws,
       rng$we,
-      paste0("Google Calendar — ", as_date(rng$ws), " — ", as_date(rng$we))
+      paste0("Google Calendar — ", as_date(rng$ws), " — ", as_date(rng$we)),
+      color_map = gcal_color_map()
     )
+  })
+
+  schedule_slots <- reactive({
+    df <- gcal_future_prepared()
+    dur <- as.numeric(input$schedule_duration)
+    if (is.null(df) || !nrow(df) || is.na(dur)) return(tibble())
+    find_free_slots(df, duration_hours = dur, days_ahead = 14, tz = local_tz)
+  })
+
+  output$schedule_table <- render_gt({
+    slots <- schedule_slots()
+    if (is.null(slots) || !nrow(slots)) {
+      return(gt::gt(tibble(msg = "No openings found in the next two weeks (Mon–Fri, 8am–6pm).")))
+    }
+    slots %>%
+      slice_head(n = 40) %>%
+      gt::gt() %>%
+      gt::cols_label(
+        day_label  = "Date",
+        weekday    = "Weekday",
+        time_range = "Time",
+        start_local = "Start",
+        end_local   = "End"
+      ) %>%
+      gt::fmt_datetime(columns = c(start_local, end_local), date_style = 3, time_style = 3) %>%
+      gt::tab_header(title = "Suggested Times (Next 2 Weeks)") %>%
+      gt::tab_options(table.font.size = px(14))
   })
 }
 
