@@ -308,6 +308,24 @@ ui <- fluidPage(
             )
           )
         ),
+        tabPanel("Trends",
+          fluidRow(
+            column(4,
+              selectizeInput(
+                "trend_categories",
+                "Categories to display",
+                choices = NULL,
+                multiple = TRUE,
+                options = list(placeholder = "All designated categories")
+              )
+            )
+          ),
+          fluidRow(
+            column(12,
+              plotlyOutput("weekly_trend_plot", height = "520px")
+            )
+          )
+        ),
         tabPanel("Search",
           fluidRow(
             column(4,
@@ -416,6 +434,31 @@ server <- function(input, output, session) {
   history_prepared <- reactive({
     prepare_toggl(toggl_history(), local_tz = local_tz, week_start = 7) %>%
       apply_uncategorized_labels(label = uncategorized_label)
+  })
+
+  weekly_category_hours <- reactive({
+    df <- history_prepared()
+    if (is.null(df) || !nrow(df)) return(tibble())
+    if (!"category" %in% names(df)) {
+      df <- df %>% mutate(category = NA_character_)
+    }
+    df %>%
+      left_join(time_targets %>% select(Project_Name, Category), by = c("project" = "Project_Name")) %>%
+      mutate(target_category = coalesce(Category, category, uncategorized_label)) %>%
+      group_by(week_start, target_category) %>%
+      summarise(hours = sum(duration_hr, na.rm = TRUE), .groups = "drop") %>%
+      arrange(week_start, target_category)
+  })
+
+  observeEvent(weekly_category_hours(), {
+    df <- weekly_category_hours()
+    cats <- if (is.null(df) || !nrow(df)) character() else df %>% distinct(target_category) %>% arrange(target_category) %>% pull()
+    selected <- isolate(input$trend_categories)
+    selected <- selected[selected %in% cats]
+    if (!length(selected) && length(cats)) {
+      selected <- cats
+    }
+    updateSelectizeInput(session, "trend_categories", choices = cats, selected = selected, server = FALSE)
   })
 
   observeEvent(history_prepared(), {
@@ -635,6 +678,33 @@ server <- function(input, output, session) {
 
     ggplotly(p, tooltip = "text") %>%
       layout(xaxis = list(title = "Hours"), yaxis = list(title = "Project"))
+  })
+
+  output$weekly_trend_plot <- renderPlotly({
+    df <- weekly_category_hours()
+    if (is.null(df) || !nrow(df)) return(NULL)
+
+    chosen <- input$trend_categories
+    if (!is.null(chosen) && length(chosen)) {
+      df <- df %>% filter(target_category %in% chosen)
+    }
+    if (!nrow(df)) return(NULL)
+
+    df <- df %>%
+      mutate(
+        week_label = paste0(as_date(week_start), " — ", as_date(week_start + days(6))),
+        tooltip = paste0("<b>", target_category, "</b><br>Week of ", week_label, "<br>", round(hours, 1), "h")
+      )
+
+    p <- ggplot(df, aes(x = week_start, y = hours, color = target_category, text = tooltip, group = target_category)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 2) +
+      labs(title = "Weekly hours by category", x = "Week starting", y = "Hours") +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "bottom")
+
+    ggplotly(p, tooltip = "text") %>%
+      layout(xaxis = list(title = "Week starting"), yaxis = list(title = "Hours"))
   })
 
   # Calendar plot (week grid showing time-of-day blocks)
